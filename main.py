@@ -1,420 +1,520 @@
 import os
 import re
 import time
-import random
-import datetime
-import smtplib
 import threading
-import pandas as pd
-import requests
-from bs4 import BeautifulSoup
-from duckduckgo_search import DDGS
-from email.mime.text import MIMEText
+import smtplib
 from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
-from flask import Flask, render_template_string, request, jsonify, send_file
+from flask import Flask, render_template_string, request, jsonify, redirect, url_for, flash, send_file
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
+from werkzeug.security import generate_password_hash, check_password_hash
+import requests
+from duckduckgo_search import DDGS
+import pandas as pd
 
 app = Flask(__name__)
+app.config['SECRET_KEY'] = 'super-secret-key-change-this'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///bewerbung_app.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-# سجلات وحالات النظام
-logs = []
-scraper_running = False
-sender_running = False
+db = SQLAlchemy(app)
+login_manager = LoginManager(app)
+login_manager.login_view = 'login'
 
-ALL_GERMAN_CITIES = [
-    "Berlin", "Hamburg", "München", "Köln", "Frankfurt am Main", "Stuttgart", "Düsseldorf", 
-    "Dortmund", "Essen", "Leipzig", "Bremen", "Dresden", "Hannover", "Nürnberg", "Duisburg", 
-    "Bochum", "Wuppertal", "Bielefeld", "Bonn", "Münster", "Karlsruhe", "Mannheim", "Augsburg", 
-    "Wiesbaden", "Gelsenkirchen", "Mönchengladbach", "Braunschweig", "Chemnitz", "Kiel", 
-    "Aachen", "Halle", "Magdeburg", "Freiburg", "Krefeld", "Lübeck", "Oberhausen", "Erfurt", 
-    "Mainz", "Rostock", "Kassel", "Hagen", "Hamm", "Saarbrücken", "Mülheim an der Ruhr", 
-    "Potsdam", "Ludwigshafen", "Oldenburg", "Leverkusen", "Osnabrück", "Solingen", "Heidelberg"
-]
+# --- Multi-User Logs Storage ---
+user_scraper_logs = {}
+user_sender_logs = {}
 
-HTML_TEMPLATE = """
+def get_user_logs(user_id):
+    if user_id not in user_scraper_logs:
+        user_scraper_logs[user_id] = []
+    if user_id not in user_sender_logs:
+        user_sender_logs[user_id] = []
+    return user_scraper_logs[user_id], user_sender_logs[user_id]
+
+def log_scraper(user_id, msg):
+    s_logs, _ = get_user_logs(user_id)
+    s_logs.append(msg)
+    if len(s_logs) > 100: s_logs.pop(0)
+
+def log_sender(user_id, msg):
+    _, send_logs = get_user_logs(user_id)
+    send_logs.append(msg)
+    if len(send_logs) > 100: send_logs.pop(0)
+
+# --- Database Models ---
+class User(UserMixin, db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(150), unique=True, nullable=False)
+    password = db.Column(db.String(150), nullable=False)
+    is_approved = db.Column(db.Boolean, default=False)  # التفعيل من الإدارة
+    is_admin = db.Column(db.Boolean, default=False)     # صفتك كأدمن
+    emails = db.relationship('ExtractedEmail', backref='owner', lazy=True)
+
+class ExtractedEmail(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(255), nullable=False)
+    city = db.Column(db.String(100))
+    keyword = db.Column(db.String(100))
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+# --- Create Admin Account Automatically ---
+with app.app_context():
+    db.create_all()
+    # إنشاء حساب الأدمن الخاص بك تلقائياً إذا لم يكن موجوداً
+    admin = User.query.filter_by(username='admin').first()
+    if not admin:
+        admin_user = User(
+            username='admin',
+            password=generate_password_hash('admin12345', method='scrypt'),
+            is_approved=True,
+            is_admin=True
+        )
+        db.session.add(admin_user)
+        db.session.commit()
+
+# --- Background Scraper Task ---
+def run_scraper_task(user_id, cities, keywords, limit):
+    log_scraper(user_id, "🚀 بدأت عملية الاستخراج والتجميع...")
+    regex_email = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+    found_count = 0
+
+    for city in cities:
+        for kw in keywords:
+            query = f'"{kw}" "{city}" "E-Mail" OR "Kontakt"'
+            log_scraper(user_id, f"📍 فحص مدينة: {city} | الكلمة: {kw}")
+            try:
+                results = list(DDGS().text(query, max_results=int(limit)))
+                for res in results:
+                    url = res.get('href', '')
+                    try:
+                        resp = requests.get(url, timeout=4)
+                        if resp.status_code == 200:
+                            matches = re.findall(regex_email, resp.text)
+                            for em in matches:
+                                clean_em = em.lower().strip('.')
+                                if not clean_em.endswith(('png', 'jpg', 'jpeg', 'gif', 'svg')):
+                                    with app.app_context():
+                                        exists = ExtractedEmail.query.filter_by(email=clean_em, user_id=user_id).first()
+                                        if not exists:
+                                            new_em = ExtractedEmail(email=clean_em, city=city, keyword=kw, user_id=user_id)
+                                            db.session.add(new_em)
+                                            db.session.commit()
+                                            found_count += 1
+                    except Exception:
+                        continue
+            except Exception as e:
+                log_scraper(user_id, f"⚠️ تنبيه فـ البحث: {str(e)}")
+
+    log_scraper(user_id, f"🎉 اكتمل البحث! تم حفظ {found_count} إيميل جديد فـ حسابك.")
+
+# --- Background Sender Task ---
+def run_sender_task(user_id, gmail_user, gmail_pass, subject, body_text, pdf_data, pdf_name, max_send):
+    log_sender(user_id, "🔒 الاتصال بسيرفر Gmail SMTP...")
+    try:
+        server = smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=12)
+        server.login(gmail_user, gmail_pass)
+        log_sender(user_id, "✅ تم الربط مع Gmail بنجاح!")
+    except smtplib.SMTPAuthenticationError:
+        log_sender(user_id, "❌ خطأ فـ الدخول! تأكد من استخدام App Password الخاص بـ Gmail.")
+        return
+    except Exception as e:
+        log_sender(user_id, f"❌ فشل الاتصال بالسيرفر: {str(e)}")
+        return
+
+    with app.app_context():
+        user_emails = ExtractedEmail.query.filter_by(user_id=user_id).limit(int(max_send)).all()
+        if not user_emails:
+            log_sender(user_id, "⚠️ لا توجد إيميلات مستخرجة فـ حسابك للإرسال إليها!")
+            server.quit()
+            return
+
+        log_sender(user_id, f"📨 بدء إرسال الرسائل إلى {len(user_emails)} مستلم...")
+        sent_count = 0
+
+        for item in user_emails:
+            try:
+                msg = MIMEMultipart()
+                msg['From'] = gmail_user
+                msg['To'] = item.email
+                msg['Subject'] = subject
+                msg.attach(MIMEText(body_text, 'plain'))
+
+                if pdf_data:
+                    part = MIMEApplication(pdf_data, Name=pdf_name)
+                    part['Content-Disposition'] = f'attachment; filename="{pdf_name}"'
+                    msg.attach(part)
+
+                server.sendmail(gmail_user, item.email, msg.as_string())
+                sent_count += 1
+                log_sender(user_id, f"✅ تم الإرسال بنجاح إلى: {item.email}")
+                time.sleep(2)
+            except Exception as e:
+                log_sender(user_id, f"❌ فشل الإرسال إلى {item.email}: {str(e)}")
+
+        server.quit()
+        log_sender(user_id, f"🏁 اكتملت الحملة! تم إرسال {sent_count} رسالة بنجاح.")
+
+# --- HTML Layout ---
+BASE_LAYOUT = """
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Bewerbung Platform Suite</title>
-    <meta name="theme-color" content="#0f172a">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bewerbung Automation Platform</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
-        * { box-sizing: border-box; }
-        body { font-family: system-ui, -apple-system, sans-serif; background-color: #0f172a; color: #f8fafc; margin: 0; padding: 15px; }
-        .container { max-width: 900px; margin: 0 auto; background: #1e293b; padding: 20px; border-radius: 16px; box-shadow: 0 4px 20px rgba(0,0,0,0.4); }
-        h1 { color: #38bdf8; text-align: center; font-size: 1.5rem; margin-top: 10px; margin-bottom: 20px; }
-        
-        /* Nav Tabs */
-        .tabs { display: flex; gap: 10px; margin-bottom: 20px; border-bottom: 2px solid #334155; padding-bottom: 10px; }
-        .tab-btn { flex: 1; padding: 12px; background: #334155; color: #94a3b8; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; text-align: center; font-size: 0.95rem; transition: 0.2s; }
-        .tab-btn.active { background: #0284c7; color: #fff; }
-        
-        .tab-content { display: none; }
-        .tab-content.active { display: block; }
-        
-        .section { background: #334155; padding: 18px; margin-bottom: 20px; border-radius: 12px; }
-        h2 { margin-top: 0; color: #facc15; font-size: 1.1rem; }
-        
-        .form-group { margin-bottom: 15px; display: flex; flex-direction: column; gap: 6px; }
-        label { font-weight: 600; font-size: 0.88rem; color: #e2e8f0; }
-        input[type="text"], input[type="password"], input[type="file"], input[type="number"], select { padding: 12px; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: #fff; font-size: 0.95rem; width: 100%; }
-        
-        button.action-btn { padding: 14px; font-weight: bold; border: none; border-radius: 8px; cursor: pointer; transition: 0.2s; color: white; width: 100%; font-size: 1rem; margin-top: 10px; }
-        .btn-scrape { background: #2563eb; } .btn-scrape:hover { background: #1d4ed8; }
-        .btn-send { background: #0284c7; } .btn-send:hover { background: #0369a1; }
-        
-        #log-box { background: #020617; color: #38bdf8; padding: 12px; height: 300px; overflow-y: auto; font-family: monospace; border-radius: 8px; border: 1px solid #334155; white-space: pre-wrap; line-height: 1.5; font-size: 0.82rem; }
-        .hidden { display: none; }
+        body { background-color: #0f172a; color: #f8fafc; font-family: system-ui; }
+        .card { background-color: #1e293b; border: 1px solid #334155; }
+        .nav-link { color: #94a3b8; font-weight: bold; }
+        .nav-link.active { color: #6366f1 !important; border-bottom: 2px solid #6366f1; }
+        .log-box { background-color: #090d16; border: 1px solid #1e293b; font-family: monospace; height: 220px; overflow-y: auto; padding: 10px; border-radius: 6px; }
+        .form-control { background-color: #0f172a; border: 1px solid #334155; color: #fff; }
+        .form-control:focus { background-color: #1e293b; color: #fff; }
     </style>
 </head>
-<body>
-    <div class="container">
-        <h1>🚀 Bewerbung Automator Suite Pro</h1>
-
-        <!-- الأزرار الرئيسية بين الأقسام -->
-        <div class="tabs">
-            <button class="tab-btn active" onclick="switchTab('tab-scrape')">1. الجمع والتعدين 🔍</button>
-            <button class="tab-btn" onclick="switchTab('tab-send')">2. الإرسال الذكي ✉️</button>
+<body class="p-3 p-md-4">
+    <div class="container" style="max-width: 1000px;">
+        <div class="d-flex justify-content-between align-items-center mb-4">
+            <h3 class="text-primary fw-bold">🚀 Bewerbung Automation</h3>
+            {% if current_user.is_authenticated %}
+                <div>
+                    <span class="me-2 text-light">مرحباً {{ current_user.username }} 👋</span>
+                    {% if current_user.is_admin %}
+                        <a href="{{ url_for('admin_panel') }}" class="btn btn-warning btn-sm me-2">لوحة الأدمن 👑</a>
+                    {% endif %}
+                    <a href="{{ url_for('logout') }}" class="btn btn-outline-danger btn-sm">خروج</a>
+                </div>
+            {% endif %}
         </div>
 
-        <!-- 1. قسم الجمع -->
-        <div id="tab-scrape" class="tab-content active">
-            <div class="section">
-                <h2>إعداد خيارات البحث واستخراج الإيمايلات</h2>
-                <form id="scrape-form">
-                    <div class="form-group">
-                        <label>اختر المجال (Niche):</label>
-                        <select name="niche_select" id="niche_select" onchange="toggleCustomNiche()">
-                            <option value="Pflegedienst">🏥 Pflege & Gesundheit (التمريض والصحة)</option>
-                            <option value="Elektriker">⚡ Handwerk & Elektronik (الكهرباء والحرف)</option>
-                            <option value="Gastronomie Hotellerie">🏨 Gastronomie & Hotellerie (الفنادق والمطاعم)</option>
-                            <option value="IT Softwareentwicklung">💻 IT & Software (تكنولوجيا المعلومات)</option>
-                            <option value="Logistik Lager">📦 Logistik & Lager (اللوجستيك)</option>
-                            <option value="Mechatroniker Kfz">🔧 Mechatronik & Kfz (الميكانيك)</option>
-                            <option value="custom">✏️ مجال آخر (اكتبه يدويًا)...</option>
-                        </select>
-                    </div>
+        {% if current_user.is_authenticated and current_user.is_approved %}
+        <ul class="nav nav-tabs mb-4 border-secondary">
+            <li class="nav-item">
+                <a class="nav-link {% if active_tab == 'scraper' %}active{% endif %}" href="{{ url_for('scraper_page') }}">🔎 1. استخراج الإيميلات</a>
+            </li>
+            <li class="nav-item">
+                <a class="nav-link {% if active_tab == 'sender' %}active{% endif %}" href="{{ url_for('sender_page') }}">📧 2. الإرسال الذكي</a>
+            </li>
+        </ul>
+        {% endif %}
 
-                    <div class="form-group hidden" id="custom_niche_group">
-                        <label>المجال بال ألمانية:</label>
-                        <input type="text" name="custom_niche" placeholder="مثال: Dachdecker, Tischler...">
-                    </div>
+        {% with messages = get_flashed_messages(with_categories=true) %}
+          {% if messages %}
+            {% for category, message in messages %}
+              <div class="alert alert-{{ category }}">{{ message }}</div>
+            {% endfor %}
+          {% endif %}
+        {% endwith %}
 
-                    <div class="form-group">
-                        <label>النطاق الجغرافي:</label>
-                        <select name="city_choice">
-                            <option value="ALL">🇩🇪 جميع مدن ألمانيا (Alle Städte)</option>
-                            <option value="Berlin">Berlin</option>
-                            <option value="München">München</option>
-                            <option value="Hamburg">Hamburg</option>
-                            <option value="Köln">Köln</option>
-                            <option value="Frankfurt am Main">Frankfurt am Main</option>
-                        </select>
-                    </div>
-
-                    <button type="submit" class="action-btn btn-scrape">بدء البحث واستخراج البيانات 🚀</button>
-                </form>
-            </div>
-        </div>
-
-        <!-- 2. قسم الإرسال الذكي -->
-        <div id="tab-send" class="tab-content">
-            <div class="section">
-                <h2>إطلاق الحملات فائقة التخصيص 🧠</h2>
-                <form id="send-form" enctype="multipart/form-data">
-                    <div class="form-group">
-                        <label>Gmail Email:</label>
-                        <input type="text" name="email" placeholder="example@gmail.com" required>
-                    </div>
-                    <div class="form-group">
-                        <label>Gmail App Password:</label>
-                        <input type="password" name="password" placeholder="xxxx xxxx xxxx xxxx" required>
-                    </div>
-                    <div class="form-group">
-                        <label>ملف البيانات (اختياري - يترك فارغ لاستخدام قاعدة البيانات المجمعة):</label>
-                        <input type="file" name="data_file" accept=".xlsx, .csv">
-                    </div>
-                    <div class="form-group">
-                        <label>ملف الـ CV (PDF):</label>
-                        <input type="file" name="cv_file" accept=".pdf" required>
-                    </div>
-                    <div class="form-group">
-                        <label>الحد الأقصى للإرسال:</label>
-                        <input type="number" name="daily_limit" value="40" min="1" max="100">
-                    </div>
-                    <button type="submit" class="action-btn btn-send">بدء الحملة الذكية 🚀</button>
-                </form>
-            </div>
-        </div>
-
-        <!-- السجل المباشر -->
-        <div class="section">
-            <h2>سجل العمليات المباشر (Live Log) 📋</h2>
-            <div id="log-box">جاهز للعمل...</div>
-        </div>
+        {% block content %}{% endblock %}
     </div>
-
-    <script>
-        function switchTab(tabId) {
-            document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
-            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-            document.getElementById(tabId).classList.add('active');
-            event.currentTarget.classList.add('active');
-        }
-
-        function toggleCustomNiche() {
-            const select = document.getElementById('niche_select');
-            const customGroup = document.getElementById('custom_niche_group');
-            if (select.value === 'custom') customGroup.classList.remove('hidden');
-            else customGroup.classList.add('hidden');
-        }
-
-        setInterval(() => {
-            fetch('/get_logs')
-                .then(r => r.json())
-                .then(data => {
-                    const logBox = document.getElementById('log-box');
-                    logBox.textContent = data.logs.join('\\n');
-                    logBox.scrollTop = logBox.scrollHeight;
-                });
-        }, 1200);
-
-        document.getElementById('scrape-form').onsubmit = async (e) => {
-            e.preventDefault();
-            const formData = new FormData(e.target);
-            await fetch('/start_scrape', { method: 'POST', body: formData });
-        };
-
-        document.getElementById('send-form').onsubmit = async (e) => {
-            e.preventDefault();
-            const formData = new FormData(e.target);
-            await fetch('/start_send', { method: 'POST', body: formData });
-        };
-    </script>
 </body>
 </html>
 """
 
-def add_log(text):
-    global logs
-    logs.append(text)
-    if len(logs) > 300:
-        logs.pop(0)
-
-@app.route('/')
-def home():
-    return render_template_string(HTML_TEMPLATE)
-
-@app.route('/get_logs')
-def get_logs():
-    return jsonify({"logs": logs})
-
-# Logic 1: Contact Extraction
-def extract_contact_person(text):
-    match = re.search(r'(Ansprechpartner(?:in)?|Kontakt|Ihr Ansprechpartner):\s*(Herr|Frau)\s+([A-Z][a-zäöüß]+(?:\s+[A-Z][a-zäöüß]+)?)', text, re.IGNORECASE)
-    if match: return match.group(2).strip(), match.group(3).strip()
-    match_direct = re.search(r'(Herr|Frau)\s+([A-Z][a-zäöüß]+(?:\s+[A-Z][a-zäöüß]+)?)', text)
-    if match_direct: return match_direct.group(1).strip(), match_direct.group(2).strip()
-    return "", ""
-
-def extract_company_name(url, soup):
-    if soup.title and soup.title.string:
-        title = soup.title.string.strip()
-        parts = re.split(r'[-|–:]', title)
-        if len(parts) > 0 and len(parts[0].strip()) < 40:
-            return parts[0].strip()
-    return ""
-
-def run_scraper_task(niche, city_choice):
-    global scraper_running
-    scraper_running = True
-    cities_to_search = ALL_GERMAN_CITIES if city_choice == "ALL" else [city_choice]
-    add_log(f"🔎 بداية البحث فـ المجال: [{niche}] | النطاق: [{city_choice}]...")
-
-    email_regex = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-    headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)'}
-    total_saved = 0
-
-    for city in cities_to_search:
-        add_log(f"📍 فحص مدينة: {city}...")
-        search_queries = [f'{niche} {city} Bewerbung E-Mail', f'{niche} {city} Kontakt']
-        city_urls = set()
+# --- Auth Routes ---
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        if User.query.filter_by(username=username).first():
+            flash('اسم المستخدم مستعمل بالفعل!', 'danger')
+            return redirect(url_for('register'))
+            
+        user = User(
+            username=username, 
+            password=generate_password_hash(password, method='scrypt'),
+            is_approved=False # الحساب كيتسجل معطل حيت خصك تفعلوا أنت
+        )
+        db.session.add(user)
+        db.session.commit()
+        flash('تم إنشاء حسابك بنجاح! حسابك فـ طور التفعيل من طرف الإدارة. تواصل معنا لتفعيل الحساب.', 'info')
+        return redirect(url_for('login'))
         
-        with DDGS() as ddgs:
-            for q in search_queries:
-                try:
-                    for r in ddgs.text(q, max_results=10):
-                        if isinstance(r, dict) and 'href' in r: city_urls.add(r['href'])
-                except Exception: continue
+    return render_template_string(BASE_LAYOUT + """
+    {% block content %}
+    <div class="card p-4 mx-auto" style="max-width: 450px;">
+        <h4 class="mb-3 text-center">إنشاء حساب جديد</h4>
+        <form method="POST">
+            <div class="mb-3"><label>اسم المستخدم</label><input type="text" name="username" class="form-control" required></div>
+            <div class="mb-3"><label>كلمة السر</label><input type="password" name="password" class="form-control" required></div>
+            <button type="submit" class="btn btn-primary w-100">تسجيل الحساب</button>
+        </form>
+        <p class="mt-3 mb-0 text-center">عندك حساب؟ <a href="{{ url_for('login') }}">سجل الدخول</a></p>
+    </div>
+    {% endblock %}
+    """)
 
-        city_results = []
-        for url in city_urls:
-            try:
-                res = requests.get(url, headers=headers, timeout=5)
-                soup = BeautifulSoup(res.text, 'html.parser')
-                company_name = extract_company_name(url, soup)
-                salutation, person_name = extract_contact_person(soup.get_text())
-                found_emails = set(re.findall(email_regex, res.text))
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        user = User.query.filter_by(username=request.form.get('username')).first()
+        if user and check_password_hash(user.password, request.form.get('password')):
+            login_user(user)
+            if not user.is_approved:
+                flash('حسابك غير مفعل بعد! المرجو التواصل مع الإدارة للتفعيل.', 'warning')
+                return redirect(url_for('unapproved'))
+            return redirect(url_for('scraper_page'))
+        flash('معلومات الدخول غير صحيحة!', 'danger')
+    return render_template_string(BASE_LAYOUT + """
+    {% block content %}
+    <div class="card p-4 mx-auto" style="max-width: 450px;">
+        <h4 class="mb-3 text-center">تسجيل الدخول</h4>
+        <form method="POST">
+            <div class="mb-3"><label>اسم المستخدم</label><input type="text" name="username" class="form-control" required></div>
+            <div class="mb-3"><label>كلمة السر</label><input type="password" name="password" class="form-control" required></div>
+            <button type="submit" class="btn btn-primary w-100">دخول</button>
+        </form>
+        <p class="mt-3 mb-0 text-center">ما عندكش حساب؟ <a href="{{ url_for('register') }}">أنشئ حساباً</a></p>
+    </div>
+    {% endblock %}
+    """)
 
-                for email in found_emails:
-                    email_lower = email.lower()
-                    if any(email_lower.endswith(ext) for ext in ['.png', '.jpg', '.css', '.js']): continue
-                    if any(bad in email_lower for bad in ['example', 'wixpress', 'datenschutz']): continue
+@app.route('/unapproved')
+@login_required
+def unapproved():
+    if current_user.is_approved:
+        return redirect(url_for('scraper_page'))
+    return render_template_string(BASE_LAYOUT + """
+    {% block content %}
+    <div class="card p-4 mx-auto text-center" style="max-width: 500px;">
+        <h4 class="text-warning mb-3">⏳ الحساب فـ طور التفعيل</h4>
+        <p>شكراً لتسجيلك! حسابك مغلق حالياً حتى يتم تأكيده وتفعيله من طرف Admin.</p>
+        <p class="text-muted small">يرجى مراسلتنا لإتمام عملية الاشتراك وتفعيل حسابك فوراً.</p>
+        <a href="{{ url_for('logout') }}" class="btn btn-outline-light btn-sm mt-2">تسجيل الخروج</a>
+    </div>
+    {% endblock %}
+    """)
 
-                    city_results.append({
-                        "Niche": niche, "City": city, "Company": company_name,
-                        "Salutation": salutation, "ContactPerson": person_name,
-                        "Email": email_lower, "Status": "Pending"
-                    })
-                    add_log(f"✅ [{city}] تم إيجاد: {email_lower}")
-            except Exception: continue
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for('login'))
 
-        if city_results:
-            df = pd.DataFrame(city_results).drop_duplicates(subset=['Email'])
-            file_exists = os.path.exists("emails_database.csv")
-            df.to_csv("emails_database.csv", mode='a', index=False, header=not file_exists)
-            total_saved += len(df)
+# --- Admin Panel Route ---
+@app.route('/admin')
+@login_required
+def admin_panel():
+    if not current_user.is_admin:
+        flash('غير مسموح لك بالدخول لهذه الصفحة!', 'danger')
+        return redirect(url_for('scraper_page'))
+    users = User.query.filter(User.id != current_user.id).all()
+    return render_template_string(BASE_LAYOUT + """
+    {% block content %}
+    <div class="card p-4">
+        <h4 class="mb-3 text-warning">👑 لوحة التحكم بـ الزبائن (Admin Panel)</h4>
+        <div class="table-responsive">
+            <table class="table table-dark table-striped">
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        <th>اسم الزبون</th>
+                        <th>حالة الحساب</th>
+                        <th>التحكم</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for u in users %}
+                    <tr>
+                        <td>{{ loop.index }}</td>
+                        <td>{{ u.username }}</td>
+                        <td>
+                            {% if u.is_approved %}
+                                <span class="badge bg-success">مفعل ✅</span>
+                            {% else %}
+                                <span class="badge bg-warning text-dark">معطل ⏳</span>
+                            {% endif %}
+                        </td>
+                        <td>
+                            {% if u.is_approved %}
+                                <a href="/admin/toggle/{{ u.id }}" class="btn btn-sm btn-outline-danger">إلغاء التفعيل ❌</a>
+                            {% else %}
+                                <a href="/admin/toggle/{{ u.id }}" class="btn btn-sm btn-success">تفعيل الحساب 🚀</a>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% else %}
+                    <tr><td colspan="4" class="text-center text-muted">لا يوجد زبائن مسجلون بعد.</td></tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endblock %}
+    """)
 
-    add_log(f"\n🎉 انتهى البحث! تم حفظ: {total_saved} إيميل فـ emails_database.csv.")
-    scraper_running = False
+@app.route('/admin/toggle/<int:user_id>')
+@login_required
+def toggle_user(user_id):
+    if not current_user.is_admin:
+        return redirect(url_for('scraper_page'))
+    user = User.query.get_or_404(user_id)
+    user.is_approved = not user.is_approved
+    db.session.commit()
+    flash(f"تم تغيير حالة حساب الزبون {user.username} بنجاح!", "success")
+    return redirect(url_for('admin_panel'))
 
-@app.route('/start_scrape', methods=['POST'])
-def start_scrape():
-    global scraper_running
-    if scraper_running: return jsonify({"status": "جاري الجمع..."})
-    niche_select = request.form.get('niche_select')
-    niche = request.form.get('custom_niche', 'Allgemein') if niche_select == 'custom' else niche_select
-    city_choice = request.form.get('city_choice', 'ALL')
-    threading.Thread(target=run_scraper_task, args=(niche, city_choice)).start()
-    return jsonify({"status": "تم البدء"})
+# --- App Tab 1: Scraper ---
+@app.route('/')
+@app.route('/scraper', methods=['GET', 'POST'])
+@login_required
+def scraper_page():
+    if not current_user.is_approved: return redirect(url_for('unapproved'))
+    
+    if request.method == 'POST':
+        cities = [c.strip() for c in request.form.get('cities', '').split(',') if c.strip()]
+        keywords = [k.strip() for k in request.form.get('keywords', '').split(',') if k.strip()]
+        limit = request.form.get('limit', 10)
+        
+        t = threading.Thread(target=run_scraper_task, args=(current_user.id, cities, keywords, limit))
+        t.start()
+        flash('بدأت عملية الاستخراج فـ الخلفية!', 'info')
+        return redirect(url_for('scraper_page'))
 
-# Logic 2: Smart Email Personalization & Sending
-def extract_company_from_email(email):
-    try:
-        domain = email.split('@')[1].lower()
-        public_domains = ['gmail.', 'yahoo.', 'hotmail.', 'outlook.', 'gmx.', 'web.']
-        if any(pub in domain for pub in public_domains): return "", "allgemein"
-        domain_name = domain.split('.')[0].replace('-', ' ').replace('_', ' ')
-        company_clean = ' '.join(word.capitalize() for word in domain_name.split())
-        return company_clean, "Fachkraft"
-    except: return "", "Fachkraft"
+    emails = ExtractedEmail.query.filter_by(user_id=current_user.id).all()
+    return render_template_string(BASE_LAYOUT + """
+    {% block content %}
+    <div class="row">
+        <div class="col-md-6 mb-3">
+            <div class="card p-3">
+                <h5 class="mb-3 text-info">إعدادات البحث والاستخراج</h5>
+                <form method="POST">
+                    <div class="mb-2"><label>المدن (مفصولة بفارزة)</label><input type="text" name="cities" class="form-control" value="Berlin, Hamburg, München" required></div>
+                    <div class="mb-2"><label>الكلمات المفتاحية</label><input type="text" name="keywords" class="form-control" value="Altenpflege, Pflegeheim" required></div>
+                    <div class="mb-3"><label>عدد النتائج لكل بحث</label><input type="number" name="limit" class="form-control" value="15" max="50"></div>
+                    <button type="submit" class="btn btn-primary w-100">بدء الاستخراج 🔎</button>
+                </form>
+            </div>
+        </div>
+        <div class="col-md-6 mb-3">
+            <div class="card p-3">
+                <h5 class="mb-3 text-warning">📋 سجل الاستخراج المباشر (Scraper Log)</h5>
+                <div id="scraperLog" class="log-box text-info">في انتظار بدء الاستخراج...</div>
+            </div>
+        </div>
+    </div>
 
-def generate_hyper_personalized_email(email, csv_company, csv_niche, city, greeting):
-    extracted_company, detected_niche = extract_company_from_email(email)
-    company_final = csv_company if (csv_company and csv_company != 'nan') else (f"Firma {extracted_company}" if extracted_company else f"Ihrem Unternehmen in {city}")
-    niche_final = csv_niche if (csv_niche and csv_niche != 'nan') else detected_niche
+    <div class="card p-3 mt-2">
+        <div class="d-flex justify-content-between align-items-center mb-3">
+            <h5>الإيميلات المجمعة فـ حسابك ({{ emails|length }})</h5>
+            {% if emails %}
+                <a href="{{ url_for('export_excel') }}" class="btn btn-success btn-sm">تحميل Excel 📊</a>
+            {% endif %}
+        </div>
+        <div class="table-responsive" style="max-height: 250px;">
+            <table class="table table-dark table-striped table-sm">
+                <thead><tr><th>#</th><th>الإيميل</th><th>المدينة</th><th>الكلمة</th></tr></thead>
+                <tbody>
+                    {% for e in emails %}
+                    <tr><td>{{ loop.index }}</td><td>{{ e.email }}</td><td>{{ e.city }}</td><td>{{ e.keyword }}</td></tr>
+                    {% else %}
+                    <tr><td colspan="4" class="text-center text-muted">لا توجد إيميلات مستخرجة بعد.</td></tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
 
-    subjects = [
-        f"Initiativbewerbung als {niche_final} - {company_final}",
-        f"Bewerbung um eine Stelle als {niche_final} / Standort {city}"
-    ]
-    selected_subject = random.choice(subjects)
+    <script>
+        setInterval(() => {
+            fetch('/api/logs').then(r => r.json()).then(d => {
+                document.getElementById('scraperLog').innerText = d.scraper.join('\\n');
+            });
+        }, 1500);
+    </script>
+    {% endblock %}
+    """, active_tab='scraper')
 
-    body = f"""{greeting}
+# --- App Tab 2: Sender ---
+@app.route('/sender', methods=['GET', 'POST'])
+@login_required
+def sender_page():
+    if not current_user.is_approved: return redirect(url_for('unapproved'))
+    
+    if request.method == 'POST':
+        gmail_user = request.form.get('gmail_user')
+        gmail_pass = request.form.get('gmail_pass')
+        subject = request.form.get('subject')
+        body_text = request.form.get('body_text')
+        max_send = request.form.get('max_send', 45)
+        
+        pdf_file = request.files.get('pdf_file')
+        pdf_data = pdf_file.read() if pdf_file else None
+        pdf_name = pdf_file.filename if pdf_file else ""
 
-ich verfolge die Arbeit von {company_final} mit großem Interesse. Da Sie im Bereich {niche_final} etabliert sind, möchte ich mich Ihnen gerne als motivierte Fachkraft vorstellen.
+        t = threading.Thread(target=run_sender_task, args=(current_user.id, gmail_user, gmail_pass, subject, body_text, pdf_data, pdf_name, max_send))
+        t.start()
+        flash('بدأت حملة الإرسال الذكية فـ الخلفية!', 'info')
+        return redirect(url_for('sender_page'))
 
-In der beigefügten PDF-Datei finden Sie meinen vollständigen Lebenslauf.
+    return render_template_string(BASE_LAYOUT + """
+    {% block content %}
+    <div class="row">
+        <div class="col-md-7 mb-3">
+            <div class="card p-3">
+                <h5 class="mb-3 text-success">إعدادات الحملة الذكية (Gmail)</h5>
+                <form method="POST" enctype="multipart/form-data">
+                    <div class="row">
+                        <div class="col-md-6 mb-2"><label>بريد Gmail</label><input type="email" name="gmail_user" class="form-control" placeholder="your@gmail.com" required></div>
+                        <div class="col-md-6 mb-2"><label>App Password (16 حرف)</label><input type="password" name="gmail_pass" class="form-control" placeholder="xxxx xxxx xxxx xxxx" required></div>
+                    </div>
+                    <div class="mb-2"><label>عنوان الرسالة (Subject)</label><input type="text" name="subject" class="form-control" value="Bewerbung um einen Ausbildungsplatz" required></div>
+                    <div class="mb-2"><label>نص الرسالة</label><textarea name="body_text" class="form-control" rows="3" required>Sehr geehrte Damen und Herren,...</textarea></div>
+                    <div class="row">
+                        <div class="col-md-7 mb-2"><label>ملف الـ CV (PDF)</label><input type="file" name="pdf_file" class="form-control" accept=".pdf"></div>
+                        <div class="col-md-5 mb-3"><label>الحد الأقصى للإرسال</label><input type="number" name="max_send" class="form-control" value="45"></div>
+                    </div>
+                    <button type="submit" class="btn btn-success w-100">بدء الحملة الذكية 🚀</button>
+                </form>
+            </div>
+        </div>
+        <div class="col-md-5 mb-3">
+            <div class="card p-3">
+                <h5 class="mb-3 text-success">📨 سجل الإرسال المباشر (Sender Log)</h5>
+                <div id="senderLog" class="log-box text-success">في انتظار بدء الحملة...</div>
+            </div>
+        </div>
+    </div>
 
-Über die Gelegenheit zu einem kurzen Kennenlernen-Gespräch würde ich mich sehr freuen.
+    <script>
+        setInterval(() => {
+            fetch('/api/logs').then(r => r.json()).then(d => {
+                document.getElementById('senderLog').innerText = d.sender.join('\\n');
+            });
+        }, 1500);
+    </script>
+    {% endblock %}
+    """, active_tab='sender')
 
-Mit freundlichen Grüßen
-"""
-    return selected_subject, body, company_final
+# --- Helper Routes ---
+@app.route('/api/logs')
+@login_required
+def api_logs():
+    scraper, sender = get_user_logs(current_user.id)
+    return jsonify({"scraper": scraper, "sender": sender})
 
-def run_sender_task(sender_email, sender_pass, data_file_path, cv_path, daily_limit):
-    global sender_running
-    sender_running = True
-    add_log("🔒 الاتصال بسيرفر Gmail SMTP...")
-
-    try:
-        file_to_use = data_file_path if (data_file_path and os.path.exists(data_file_path)) else "emails_database.csv"
-        if not os.path.exists(file_to_use):
-            add_log("❌ لا توجد بيانات للإرسال! قم بتشغيل البحث أو رفع ملف أولاً.")
-            sender_running = False
-            return
-
-        df = pd.read_excel(file_to_use) if file_to_use.endswith(('.xlsx', '.xls')) else pd.read_csv(file_to_use)
-
-        server = smtplib.SMTP("smtp.gmail.com", 587)
-        server.starttls()
-        server.login(sender_email, sender_pass.replace(" ", ""))
-        add_log("✅ تم الاتصال بنجاح. بدء الإرسال...")
-
-        sent_count = 0
-        for idx, row in df.iterrows():
-            if sent_count >= daily_limit: break
-            if str(row.get('Status')) == 'Sent': continue
-
-            recipient = str(row['Email']).strip()
-            if not recipient or recipient == 'nan': continue
-
-            niche = str(row.get('Niche', '')) if pd.notna(row.get('Niche')) else ""
-            city = str(row.get('City', 'Deutschland')) if pd.notna(row.get('City')) else "Deutschland"
-            company = str(row.get('Company', '')).strip() if pd.notna(row.get('Company')) else ""
-            salutation = str(row.get('Salutation', '')).strip() if pd.notna(row.get('Salutation')) else ""
-            person_name = str(row.get('ContactPerson', '')).strip() if pd.notna(row.get('ContactPerson')) else ""
-
-            greeting = f"Sehr geehrte(r) {salutation} {person_name}," if person_name else "Sehr geehrte Damen und Herren,"
-            subject, body, resolved_company = generate_hyper_personalized_email(recipient, company, niche, city, greeting)
-
-            msg = MIMEMultipart()
-            msg['From'] = sender_email
-            msg['To'] = recipient
-            msg['Subject'] = subject
-            msg.attach(MIMEText(body, 'plain', 'utf-8'))
-
-            with open(cv_path, "rb") as f:
-                attach = MIMEApplication(f.read(), _subtype="pdf")
-                attach.add_header('Content-Disposition', 'attachment', filename=os.path.basename(cv_path))
-                msg.attach(attach)
-
-            try:
-                server.sendmail(sender_email, recipient, msg.as_string())
-                df.at[idx, 'Status'] = 'Sent'
-                
-                if file_to_use.endswith('.xlsx'): df.to_excel(file_to_use, index=False)
-                else: df.to_csv(file_to_use, index=False)
-
-                sent_count += 1
-                add_log(f"✉️ [{sent_count}/{daily_limit}] تم الإرسال إلى: {recipient} ({resolved_company})")
-                
-                wait_time = random.randint(60, 120)
-                add_log(f"⏳ انتظار أمان: {wait_time} ثانية...")
-                time.sleep(wait_time)
-            except Exception as e:
-                add_log(f"❌ فشل الإرسال إلى {recipient}: {e}")
-
-        server.quit()
-        add_log("🏁 اكتملت الحملة بنجاح!")
-    except Exception as e:
-        add_log(f"❌ خطأ ف الاتصال: {e}")
-
-    sender_running = False
-
-@app.route('/start_send', methods=['POST'])
-def start_send():
-    global sender_running
-    if sender_running: return jsonify({"status": "جاري الإرسال..."})
-
-    email = request.form.get('email')
-    password = request.form.get('password')
-    daily_limit = int(request.form.get('daily_limit', 40))
-
-    cv_file = request.files['cv_file']
-    cv_path = os.path.join(".", cv_file.filename)
-    cv_file.save(cv_path)
-
-    data_path = None
-    if 'data_file' in request.files and request.files['data_file'].filename != '':
-        data_file = request.files['data_file']
-        data_path = os.path.join(".", data_file.filename)
-        data_file.save(data_path)
-
-    threading.Thread(target=run_sender_task, args=(email, password, data_path, cv_path, daily_limit)).start()
-    return jsonify({"status": "تم البدء"})
+@app.route('/export')
+@login_required
+def export_excel():
+    if not current_user.is_approved: return redirect(url_for('unapproved'))
+    emails = ExtractedEmail.query.filter_by(user_id=current_user.id).all()
+    if not emails:
+        flash('لا توجد بيانات للتحميل!', 'warning')
+        return redirect(url_for('scraper_page'))
+    df = pd.DataFrame([{'Email': e.email, 'City': e.city, 'Keyword': e.keyword} for e in emails])
+    path = f"/tmp/emails_user_{current_user.id}.xlsx"
+    df.to_excel(path, index=False)
+    return send_file(path, as_attachment=True, download_name="my_extracted_emails.xlsx")
 
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=5000)
