@@ -1,7 +1,9 @@
 Flask
-pandas
+Flask-SQLAlchemy
+Flask-Login
 requests
 beautifulsoup4
-duckduckgo_search
+duckduckgo-search
+pandas
 openpyxl
 gunicorn
