@@ -64,20 +64,22 @@ class ExtractedEmail(db.Model):
 def load_user(user_id):
     return User.query.get(int(user_id))
 
-# --- Create Admin Account Automatically ---
-with app.app_context():
-    db.create_all()
-    # إنشاء حساب الأدمن الخاص بك تلقائياً إذا لم يكن موجوداً
-    admin = User.query.filter_by(username='admin').first()
-    if not admin:
-        admin_user = User(
-            username='admin',
-            password=generate_password_hash('admin12345', method='scrypt'),
-            is_approved=True,
-            is_admin=True
-        )
-        db.session.add(admin_user)
-        db.session.commit()
+# --- Create Admin Account Automatically & Safe Init ---
+def init_db():
+    with app.app_context():
+        db.create_all()
+        admin = User.query.filter_by(username='admin').first()
+        if not admin:
+            admin_user = User(
+                username='admin',
+                password=generate_password_hash('admin12345', method='pbkdf2:sha256'),
+                is_approved=True,
+                is_admin=True
+            )
+            db.session.add(admin_user)
+            db.session.commit()
+
+init_db()
 
 # --- Background Scraper Task ---
 def run_scraper_task(user_id, cities, keywords, limit):
@@ -232,8 +234,8 @@ def register():
             
         user = User(
             username=username, 
-            password=generate_password_hash(password, method='scrypt'),
-            is_approved=False # الحساب كيتسجل معطل حيت خصك تفعلوا أنت
+            password=generate_password_hash(password, method='pbkdf2:sha256'),
+            is_approved=False
         )
         db.session.add(user)
         db.session.commit()
