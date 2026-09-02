@@ -8,7 +8,7 @@ import threading
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-from ddgs import DDGS
+from duckduckgo_search import DDGS
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
