@@ -48,9 +48,9 @@ def log_sender(user_id, msg):
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(150), unique=True, nullable=False)
-    password = db.Column(db.String(150), nullable=False)
-    is_approved = db.Column(db.Boolean, default=False)  # التفعيل من الإدارة
-    is_admin = db.Column(db.Boolean, default=False)     # صفتك كأدمن
+    password = db.Column(db.String(255), nullable=False)
+    is_approved = db.Column(db.Boolean, default=False)
+    is_admin = db.Column(db.Boolean, default=False)
     emails = db.relationship('ExtractedEmail', backref='owner', lazy=True)
 
 class ExtractedEmail(db.Model):
@@ -64,7 +64,7 @@ class ExtractedEmail(db.Model):
 def load_user(user_id):
     return User.query.get(int(user_id))
 
-# --- Create Admin Account Automatically & Safe Init ---
+# --- Create Admin Account Automatically ---
 def init_db():
     with app.app_context():
         db.create_all()
@@ -72,7 +72,7 @@ def init_db():
         if not admin:
             admin_user = User(
                 username='admin',
-                password=generate_password_hash('admin12345', method='pbkdf2:sha256'),
+                password=generate_password_hash('admin12345'),
                 is_approved=True,
                 is_admin=True
             )
@@ -234,7 +234,7 @@ def register():
             
         user = User(
             username=username, 
-            password=generate_password_hash(password, method='pbkdf2:sha256'),
+            password=generate_password_hash(password),
             is_approved=False
         )
         db.session.add(user)
@@ -259,13 +259,21 @@ def register():
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
-        user = User.query.filter_by(username=request.form.get('username')).first()
-        if user and check_password_hash(user.password, request.form.get('password')):
-            login_user(user)
-            if not user.is_approved:
-                flash('حسابك غير مفعل بعد! المرجو التواصل مع الإدارة للتفعيل.', 'warning')
-                return redirect(url_for('unapproved'))
-            return redirect(url_for('scraper_page'))
+        username = request.form.get('username')
+        password = request.form.get('password')
+        user = User.query.filter_by(username=username).first()
+        
+        try:
+            if user and check_password_hash(user.password, password):
+                login_user(user)
+                if not user.is_approved:
+                    flash('حسابك غير مفعل بعد! المرجو التواصل مع الإدارة للتفعيل.', 'warning')
+                    return redirect(url_for('unapproved'))
+                return redirect(url_for('scraper_page'))
+        except Exception:
+            flash('حدث خطأ أثناء التأكد من كلمة السر، حاول التسجيل مجدداً.', 'danger')
+            return redirect(url_for('login'))
+
         flash('معلومات الدخول غير صحيحة!', 'danger')
     return render_template_string(BASE_LAYOUT + """
     {% block content %}
